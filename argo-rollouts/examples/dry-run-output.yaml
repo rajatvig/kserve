@@ -1,0 +1,245 @@
+# DRY RUN OUTPUT - What gets created with ArgoRollout mode
+#
+# Input InferenceService:
+# ---
+# apiVersion: serving.kserve.io/v1beta1
+# kind: InferenceService
+# metadata:
+#   name: sklearn-iris
+#   namespace: default
+#   annotations:
+#     serving.kserve.io/deploymentMode: "ArgoRollout"
+# spec:
+#   predictor:
+#     minReplicas: 1
+#     model:
+#       modelFormat:
+#         name: sklearn
+#       storageUri: "gs://kfserving-examples/models/sklearn/1.0/model"
+#
+
+---
+# 1. ROLLOUT RESOURCE (instead of Deployment)
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: sklearn-iris-predictor
+  namespace: default
+  labels:
+    component: predictor
+    app: sklearn-iris-predictor
+    serving.kserve.io/inferenceservice: sklearn-iris
+  ownerReferences:
+    - apiVersion: serving.kserve.io/v1beta1
+      kind: InferenceService
+      name: sklearn-iris
+      controller: true
+      blockOwnerDeletion: true
+spec:
+  # Replicas (only set if autoscaler is disabled)
+  # If HPA/KEDA is enabled, this field is omitted
+  replicas: 1
+
+  # Revision history
+  revisionHistoryLimit: 10
+
+  # Pod selector
+  selector:
+    matchLabels:
+      app: sklearn-iris-predictor
+
+  # Pod template
+  template:
+    metadata:
+      labels:
+        app: sklearn-iris-predictor
+        component: predictor
+        serving.kserve.io/inferenceservice: sklearn-iris
+    spec:
+      # Standard pod spec fields set by setDefaultPodSpec()
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      schedulerName: default-scheduler
+
+      # Storage initializer container (if needed)
+      initContainers:
+        - name: storage-initializer
+          image: kserve/storage-initializer:latest
+          args:
+            - "gs://kfserving-examples/models/sklearn/1.0/model"
+            - "/mnt/models"
+          volumeMounts:
+            - name: kserve-provision-location
+              mountPath: /mnt/models
+
+      # Main inference container
+      containers:
+        - name: kserve-container
+          image: kserve/sklearnserver:latest
+          args:
+            - --model_name=sklearn-iris
+            - --model_dir=/mnt/models
+            - --http_port=8080
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+              name: http
+          env:
+            - name: STORAGE_URI
+              value: "gs://kfserving-examples/models/sklearn/1.0/model"
+          # Readiness probe automatically added
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            timeoutSeconds: 1
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          imagePullPolicy: IfNotPresent
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - name: kserve-provision-location
+              mountPath: /mnt/models
+
+      volumes:
+        - name: kserve-provision-location
+          emptyDir: {}
+
+  # BLUEGREEN STRATEGY (key difference from Deployment)
+  strategy:
+    blueGreen:
+      # Active service (production traffic)
+      activeService: sklearn-iris-predictor
+
+      # Preview service (new version testing)
+      previewService: sklearn-iris-predictor-preview
+
+      # Auto-promotion enabled (no manual approval needed)
+      autoPromotionEnabled: true
+
+      # Wait 30 seconds before scaling down old version
+      scaleDownDelaySeconds: 30
+
+---
+# 2. ACTIVE SERVICE (stable/production traffic)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sklearn-iris-predictor
+  namespace: default
+  labels:
+    component: predictor
+    serving.kserve.io/inferenceservice: sklearn-iris
+  ownerReferences:
+    - apiVersion: serving.kserve.io/v1beta1
+      kind: InferenceService
+      name: sklearn-iris
+      controller: true
+      blockOwnerDeletion: true
+spec:
+  type: ClusterIP
+  selector:
+    app: sklearn-iris-predictor
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080
+
+---
+# 3. PREVIEW SERVICE (new version testing during rollout)
+apiVersion: v1
+kind: Service
+metadata:
+  name: sklearn-iris-predictor-preview
+  namespace: default
+  labels:
+    component: predictor
+    serving.kserve.io/inferenceservice: sklearn-iris
+    serving.kserve.io/rollout-preview: "true"  # Identifies this as preview service
+  ownerReferences:
+    - apiVersion: serving.kserve.io/v1beta1
+      kind: InferenceService
+      name: sklearn-iris
+      controller: true
+      blockOwnerDeletion: true
+spec:
+  type: ClusterIP
+  selector:
+    app: sklearn-iris-predictor
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080
+
+---
+# 4. HTTPROUTE (Gateway API routing - unchanged from standard mode)
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: sklearn-iris-predictor
+  namespace: default
+spec:
+  parentRefs:
+    - name: kserve-gateway
+      namespace: kserve
+  hostnames:
+    - sklearn-iris.default.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        # Routes ONLY to active service (not preview)
+        - name: sklearn-iris-predictor
+          port: 80
+
+---
+# 5. HPA (if autoscaling is enabled - works with Rollouts)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sklearn-iris-predictor
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout  # HPA targets the Rollout (not Deployment)
+    name: sklearn-iris-predictor
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# ROLLOUT LIFECYCLE EXAMPLE
+#
+# Initial deployment:
+# - Rollout creates ReplicaSet-1 with pods
+# - Active service → ReplicaSet-1 pods
+# - Preview service → (no endpoints)
+#
+# User updates model (changes storageUri):
+# - Rollout creates ReplicaSet-2 with new pods
+# - Active service → ReplicaSet-1 pods (old version, still serving traffic)
+# - Preview service → ReplicaSet-2 pods (new version, available for testing)
+# - User can test new version via preview service
+#
+# After autoPromotionEnabled triggers (or manual approval):
+# - Active service → ReplicaSet-2 pods (switches atomically)
+# - Preview service → ReplicaSet-2 pods
+# - Traffic now goes to new version (zero downtime)
+#
+# After scaleDownDelaySeconds (30s):
+# - ReplicaSet-1 scaled to 0 (old version removed)
+# - Only new version remains
